@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Screen Viewer</title>
+  <style>
+    :root { color-scheme: dark; --background:#090a0c; --card:#101114; --foreground:#f4f4f1; --muted:#a1a4aa; --border:#2e3138; --primary:#c6a153; --danger:#dc2828; }
+    :root[data-theme="light"] { color-scheme: light; --background:#f7f6f2; --card:#fbfaf8; --foreground:#2a2622; --muted:#7c736a; --border:#d7d2cc; --primary:#bf9740; --danger:#c73333; }
+    * { box-sizing: border-box; }
+    [hidden] { display:none !important; }
+    body { margin:0; min-height:100vh; padding:24px; background:var(--background); color:var(--foreground); font:14px/1.5 "JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    h2 { font-size:18px; font-weight:500; margin:0 0 12px; overflow-wrap:anywhere; }
+    p { margin:0; }
+    button, select { min-height:36px; padding:8px 12px; border:1px solid var(--primary); border-radius:0; background:var(--primary); color:#101114; font:inherit; cursor:pointer; }
+    button.quiet { background:transparent; border-color:var(--border); color:var(--foreground); min-height:32px; padding:4px 10px; font-size:12px; }
+    select { background:var(--card); border-color:var(--border); color:var(--foreground); }
+    button:disabled { cursor:default; opacity:.5; }
+    button:focus-visible, select:focus-visible { outline:2px solid var(--primary); outline-offset:3px; }
+    .toolbar { display:flex; flex-wrap:wrap; align-items:flex-end; gap:12px; margin-bottom:12px; }
+    .field { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); }
+    .field select { font-size:14px; }
+    .status { color:var(--muted); font-size:12px; min-height:18px; margin-bottom:12px; }
+    .range { margin-bottom:24px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr)); gap:12px; }
+    .card { border:1px solid var(--border); background:var(--card); display:flex; flex-direction:column; min-width:0; }
+    .card-head { padding:8px 12px; border-bottom:1px solid var(--border); }
+    .vm-name { overflow-wrap:anywhere; }
+    .vm-meta { color:var(--muted); font-size:11px; min-height:16px; overflow-wrap:anywhere; }
+    .frame { display:block; width:100%; aspect-ratio:16/10; padding:0; border:0; background:var(--background); color:var(--muted); font-size:12px; position:relative; overflow:hidden; }
+    .frame img { display:block; width:100%; height:100%; object-fit:contain; }
+    .frame:disabled { opacity:1; }
+    .frame:focus-visible { outline-offset:-2px; }
+    .frame .note { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:12px; text-align:center; overflow-wrap:anywhere; }
+    .card-foot { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 12px; border-top:1px solid var(--border); font-size:11px; color:var(--muted); min-height:48px; }
+    .state { overflow-wrap:anywhere; }
+    .panel { border:1px solid var(--border); background:var(--card); padding:20px; color:var(--muted); }
+    .panel[role="alert"], .state[role="alert"], .status[role="alert"] { color:var(--danger); }
+    .detail img { display:block; max-width:100%; height:auto; border:1px solid var(--border); }
+    .detail-actions { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+    @media (max-width:480px) { body { padding:12px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <section id="overview">
+      <div class="toolbar">
+        <button id="refresh" type="button" disabled>Refresh all</button>
+        <label class="field">Auto refresh
+          <select id="auto">
+            <option value="0">Off</option>
+            <option value="30">Every 30 seconds</option>
+            <option value="60">Every minute</option>
+            <option value="300">Every 5 minutes</option>
+          </select>
+        </label>
+      </div>
+      <p id="status" class="status" aria-live="polite">Waiting for context…</p>
+      <div id="content"></div>
+    </section>
+    <section id="detail" class="detail" hidden aria-labelledby="detail-title">
+      <h2 id="detail-title"></h2>
+      <div class="detail-actions">
+        <button id="back" type="button" class="quiet">Back to all screens</button>
+        <button id="detail-refresh" type="button">Refresh screen</button>
+      </div>
+      <p id="detail-status" class="status" aria-live="polite"></p>
+      <img id="detail-image" alt="" hidden>
+    </section>
+  </main>
+  <script>
+    const CONCURRENT_CAPTURES = 4; // The bridge allows 8 calls at once.
+    const DETAIL_WIDTH = 1280;
+    const STATE_LABELS = {stopped:'Powered off', paused:'Paused', suspended:'Suspended'};
+
+    const overview = document.getElementById('overview');
+    const content = document.getElementById('content');
+    const statusLine = document.getElementById('status');
+    const refreshButton = document.getElementById('refresh');
+    const autoSelect = document.getElementById('auto');
+    const detail = document.getElementById('detail');
+    const detailTitle = document.getElementById('detail-title');
+    const detailStatus = document.getElementById('detail-status');
+    const detailImage = document.getElementById('detail-image');
+    const detailRefresh = document.getElementById('detail-refresh');
+    const backButton = document.getElementById('back');
+
+    let context = {theme: 'dark'};
+    let started = false;
+    let contextEvents = 0;
+    let generation = 0;     // Bumped by each full refresh; older passes stop.
+    let autoTimer = null;
+    let detailVM = null;
+    let detailRequest = 0;
+    const cards = new Map();     // proxmoxID -> card elements
+    const tokens = new Map();    // proxmoxID -> newest capture request
+    const lastShots = new Map(); // proxmoxID -> last image, kept across refreshes
+
+    const errorText = error => error instanceof Error ? error.message : String(error);
+
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    function showMessage(text, isError) {
+      const panel = el('p', 'panel', text);
+      if (isError) panel.setAttribute('role', 'alert');
+      content.replaceChildren(panel);
+    }
+
+    function stateLabel(state) {
+      return STATE_LABELS[state] || 'No screen (' + state + ')';
+    }
+
+    function buildCard(vm) {
+      const card = el('article', 'card');
+      const head = el('div', 'card-head');
+      head.append(el('div', 'vm-name', vm.name), el('div', 'vm-meta', [vm.ip, vm.isRouter ? 'router' : vm.os].filter(Boolean).join(' · ')));
+
+      const frame = el('button', 'frame');
+      frame.type = 'button';
+      frame.setAttribute('aria-label', 'Enlarge screen of ' + vm.name);
+      frame.addEventListener('click', () => openDetail(vm));
+      const image = el('img');
+      image.alt = 'Screen of ' + vm.name;
+      image.hidden = true;
+      const note = el('span', 'note', 'Waiting…');
+      frame.append(image, note);
+
+      const foot = el('div', 'card-foot');
+      const state = el('span', 'state', '');
+      const again = el('button', 'quiet', 'Refresh');
+      again.type = 'button';
+      again.setAttribute('aria-label', 'Refresh screen of ' + vm.name);
+      again.addEventListener('click', () => { void capture(vm); });
+      foot.append(state, again);
+
+      card.append(head, frame, foot);
+      const parts = {frame, image, note, state, again};
+      cards.set(vm.proxmoxID, parts);
+      const previous = lastShots.get(vm.proxmoxID);
+      if (previous) showImage(parts, previous);
+      return card;
+    }
+
+    function showImage(parts, shot) {
+      parts.image.src = shot.image;
+      parts.image.hidden = false;
+      parts.note.hidden = true;
+      parts.frame.disabled = false;
+      parts.state.removeAttribute('role');
+      parts.state.textContent = shot.partial ? 'Running · partial screen' : 'Running · ' + shot.time;
+    }
+
+    function showNote(parts, text, isError) {
+      parts.image.hidden = true;
+      parts.image.removeAttribute('src');
+      parts.note.hidden = false;
+      parts.note.textContent = text;
+      parts.frame.disabled = true;
+      parts.state.textContent = isError ? 'Capture failed' : '';
+      if (isError) parts.state.setAttribute('role', 'alert'); else parts.state.removeAttribute('role');
+    }
+
+    function capturedTime(value) {
+      const date = new Date(value);
+      return isNaN(date.getTime()) ? '' : date.toLocaleTimeString();
+    }
+
+    // One VM's failure stays on that VM's card.
+    async function capture(vm) {
+      const parts = cards.get(vm.proxmoxID);
+      if (!parts) return;
+      const token = (tokens.get(vm.proxmoxID) || 0) + 1;
+      tokens.set(vm.proxmoxID, token);
+      parts.again.disabled = true;
+      if (parts.image.hidden) { parts.note.hidden = false; parts.note.textContent = 'Capturing…'; }
+      try {
+        const shot = await window.ludus.request('/screen', {query: {vmid: vm.proxmoxID}});
+        if (tokens.get(vm.proxmoxID) !== token) return;
+        if (shot.image) {
+          const saved = {image: shot.image, partial: shot.partial, time: capturedTime(shot.capturedAt)};
+          lastShots.set(vm.proxmoxID, saved);
+          showImage(parts, saved);
+        } else {
+          lastShots.delete(vm.proxmoxID);
+          showNote(parts, stateLabel(shot.state), false);
+        }
+      } catch (error) {
+        if (tokens.get(vm.proxmoxID) !== token) return;
+        lastShots.delete(vm.proxmoxID);
+        showNote(parts, errorText(error), true);
+      } finally {
+        if (tokens.get(vm.proxmoxID) === token) parts.again.disabled = false;
+      }
+    }
+
+    function renderRanges(ranges) {
+      cards.clear();
+      const shown = ranges.filter(range => range.error || range.vms.length);
+      if (!shown.length) {
+        showMessage(ranges.length ? 'Your ranges have no deployed machines yet.' : 'You do not have access to any ranges yet.');
+        return [];
+      }
+      const vms = [];
+      const sections = shown.map(range => {
+        const section = el('section', 'range');
+        const title = range.name && range.name !== range.rangeID ? range.rangeID + ' · ' + range.name : range.rangeID;
+        section.append(el('h2', '', title));
+        if (range.error) {
+          const message = el('p', 'panel', range.error);
+          message.setAttribute('role', 'alert');
+          section.append(message);
+        }
+        if (range.vms.length) {
+          const grid = el('div', 'grid');
+          for (const vm of range.vms) {
+            grid.append(buildCard(vm));
+            vms.push(vm);
+          }
+          section.append(grid);
+        }
+        return section;
+      });
+      content.replaceChildren(...sections);
+      return vms;
+    }
+
+    async function refreshAll() {
+      const pass = ++generation;
+      clearTimeout(autoTimer);
+      autoTimer = null;
+      refreshButton.disabled = true;
+      statusLine.textContent = 'Loading ranges…';
+      try {
+        const inventory = await window.ludus.request('/screens');
+        if (pass !== generation) return;
+        const vms = renderRanges(inventory.ranges);
+        let next = 0, finished = 0;
+        const report = () => { statusLine.textContent = vms.length ? 'Captured ' + finished + ' of ' + vms.length + ' screens' : ''; };
+        report();
+        const worker = async () => {
+          while (next < vms.length && pass === generation) {
+            await capture(vms[next++]);
+            finished++;
+            if (pass === generation) report();
+          }
+        };
+        await Promise.all(Array.from({length: CONCURRENT_CAPTURES}, worker));
+      } catch (error) {
+        if (pass !== generation) return;
+        statusLine.textContent = '';
+        cards.clear();
+        showMessage(errorText(error), true);
+      } finally {
+        if (pass === generation) {
+          refreshButton.disabled = false;
+          scheduleAuto();
+        }
+      }
+    }
+
+    function scheduleAuto() {
+      clearTimeout(autoTimer);
+      autoTimer = null;
+      const seconds = Number(autoSelect.value);
+      if (seconds > 0) autoTimer = setTimeout(autoTick, seconds * 1000);
+    }
+
+    function autoTick() {
+      // Do not spend captures on a grid nobody can see.
+      if (detailVM) scheduleAuto(); else void refreshAll();
+    }
+
+    async function captureDetail() {
+      const id = ++detailRequest;
+      const vm = detailVM;
+      detailRefresh.disabled = true;
+      detailStatus.removeAttribute('role');
+      detailStatus.textContent = 'Capturing…';
+      try {
+        const shot = await window.ludus.request('/screen', {query: {vmid: vm.proxmoxID, width: DETAIL_WIDTH}});
+        if (id !== detailRequest) return;
+        if (shot.image) {
+          detailImage.src = shot.image;
+          detailImage.hidden = false;
+          detailStatus.textContent = (shot.partial ? 'Partial screen captured at ' : 'Captured at ') + capturedTime(shot.capturedAt);
+        } else {
+          detailImage.hidden = true;
+          detailStatus.textContent = stateLabel(shot.state);
+        }
+      } catch (error) {
+        if (id !== detailRequest) return;
+        detailImage.hidden = true;
+        detailStatus.setAttribute('role', 'alert');
+        detailStatus.textContent = errorText(error);
+      } finally {
+        if (id === detailRequest) detailRefresh.disabled = false;
+      }
+    }
+
+    function openDetail(vm) {
+      detailVM = vm;
+      detailTitle.textContent = vm.name;
+      detailImage.alt = 'Screen of ' + vm.name;
+      detailImage.hidden = true;
+      overview.hidden = true;
+      detail.hidden = false;
+      backButton.focus();
+      void captureDetail();
+    }
+
+    function closeDetail() {
+      const vm = detailVM;
+      detailVM = null;
+      detailRequest++;
+      detail.hidden = true;
+      overview.hidden = false;
+      const parts = vm && cards.get(vm.proxmoxID);
+      if (parts) {
+        if (parts.frame.disabled) parts.again.focus(); else parts.frame.focus();
+      } else {
+        refreshButton.focus();
+      }
+    }
+
+    function applyContext(next) {
+      context = {...context, ...next};
+      document.documentElement.dataset.theme = context.theme === 'light' ? 'light' : 'dark';
+      // This view spans every range, so a theme or range change never reloads it.
+      if (!started) {
+        started = true;
+        void refreshAll();
+      }
+    }
+
+    refreshButton.addEventListener('click', () => { if (!refreshButton.disabled) void refreshAll(); });
+    autoSelect.addEventListener('change', scheduleAuto);
+    backButton.addEventListener('click', closeDetail);
+    detailRefresh.addEventListener('click', () => { if (!detailRefresh.disabled) void captureDetail(); });
+    window.addEventListener('ludus:context', event => {
+      contextEvents++;
+      applyContext(event.detail || {});
+    });
+
+    async function start() {
+      try {
+        if (!window.ludus) throw new Error('Open this plugin in Ludus.');
+        const initial = await window.ludus.context();
+        // Do not replace a newer context event with an earlier context response.
+        if (contextEvents === 0) applyContext(initial);
+      } catch (error) {
+        if (contextEvents !== 0) return;
+        statusLine.textContent = '';
+        showMessage(errorText(error), true);
+      }
+    }
+    void start();
+  </script>
+</body>
+</html>

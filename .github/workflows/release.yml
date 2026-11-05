@@ -1,0 +1,107 @@
+# Release: an X.Y.Z tag (no v prefix) is the plugin version. It is linked
+# into the plugin (and its generated plugin.json) by scripts/build.sh, and the
+# validated ZIP is attached to a GitHub release. Ludus installs it from the
+# release URL (Resources → Plugins → install from GitHub).
+name: Build and release plugin
+
+on:
+  push:
+    branches: ['**']
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The plugin SDK comes from the public Ludus repository. Leave LUDUS_SDK_REF
+  # unset to follow the newest Ludus release (see scripts/fetch-sdk.sh), or set
+  # it to a branch, tag, or commit to match a specific server.
+  LUDUS_PROJECT: ${{ vars.LUDUS_PROJECT || 'badsectorlabs/ludus' }}
+  LUDUS_SDK_REF: ${{ vars.LUDUS_SDK_REF }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out plugin and tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select backend or UI-only build
+        id: plugin
+        shell: bash
+        run: |
+          if [ -f source/plugin.json ]; then echo backend=false; else echo backend=true; fi >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        if: steps.plugin.outputs.backend == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+
+      - name: Fetch Ludus plugin SDK
+        if: steps.plugin.outputs.backend == 'true'
+        shell: bash
+        run: ./scripts/fetch-sdk.sh
+
+      - name: Build and validate plugin package
+        env:
+          GOARCH: ${{ vars.LUDUS_GOARCH || 'amd64' }}
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            export PLUGIN_VERSION="$GITHUB_REF_NAME"
+          else
+            export PLUGIN_VERSION="$(git describe --tags --dirty 2>/dev/null || echo "0.0.0-dev.${GITHUB_SHA::12}")"
+          fi
+          if [ "${{ steps.plugin.outputs.backend }}" = 'true' ]; then
+            ./scripts/build.sh .ci-deps/ludus/ludus-plugin-sdk dist
+          else
+            ./scripts/build.sh dist
+          fi
+
+      - name: Set up Node for UI tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test frontend context handling
+        run: node --test scripts/test-ui.cjs
+
+      - name: Save installable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ludus-plugin-package
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out plugin and history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download validated package
+        uses: actions/download-artifact@v4
+        with:
+          name: ludus-plugin-package
+          path: dist
+
+      - name: Publish GitHub release
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

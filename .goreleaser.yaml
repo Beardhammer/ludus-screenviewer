@@ -1,0 +1,16 @@
+version: 2
+
+# scripts/build.sh produces the Ludus-specific ZIP. GoReleaser publishes it;
+# its own dist directory must not remove the package during --clean.
+dist: .goreleaser-dist
+
+builds:
+  - skip: true
+
+checksum:
+  extra_files:
+    - glob: dist/*.zip
+
+release:
+  extra_files:
+    - glob: dist/*.zip

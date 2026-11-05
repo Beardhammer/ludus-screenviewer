@@ -1,0 +1,6 @@
+dist/
+.goreleaser-dist/
+.ci-deps/
+.DS_Store
+*.test
+__pycache__/
